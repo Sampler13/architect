@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# md-to-pdf.sh — конвертация markdown в PDF через pandoc.
+# Поддерживает русский язык, таблицы, fenced code, mermaid (как код).
+#
+# Использование:
+#   ./scripts/md-to-pdf.sh <file.md> [output.pdf]
+#
+#   --toc          добавить оглавление (по умолчанию выключено)
+#   --no-numbers   убрать номера страниц
+#   --landscape    альбомная ориентация (для широких таблиц)
+#   --paper=SIZE   размер бумаги: a4 (default) | letter
+#   --font=SIZE    размер шрифта: 11pt (default), напр. 9pt для широких таблиц
+#
+# Зависимости (одно из):
+#   pandoc + typst       (рекомендуется): brew install pandoc typst
+#   pandoc + xelatex     (классика):       brew install pandoc && brew install --cask basictex
+#
+set -euo pipefail
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+WITH_TOC=0
+WITH_NUMBERS=1
+LANDSCAPE=0
+PAPER=a4
+FONTSIZE=11pt
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage 0 ;;
+    --toc) WITH_TOC=1 ;;
+    --no-numbers) WITH_NUMBERS=0 ;;
+    --landscape) LANDSCAPE=1 ;;
+    --paper=*) PAPER="${arg#*=}" ;;
+    --font=*) FONTSIZE="${arg#*=}" ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+
+[ "${#ARGS[@]}" -lt 1 ] && usage 1
+
+INPUT="${ARGS[0]}"
+[ -f "$INPUT" ] || { echo "✗ file not found: $INPUT" >&2; exit 1; }
+
+OUTPUT="${ARGS[1]:-${INPUT%.md}.pdf}"
+
+# Маркер `<!-- pdf:end -->` обрезает md: всё после него не попадает в PDF.
+# Полезно для рабочих заметок / TODO / критериев оценки, которые не должны быть в финальном документе.
+if grep -q '<!-- pdf:end -->' "$INPUT"; then
+  TRIMMED="$(mktemp -t mdpdf-trim.XXXXXX).md"
+  sed '/<!-- pdf:end -->/,$d' "$INPUT" > "$TRIMMED"
+  INPUT="$TRIMMED"
+  echo "→ trim:   stopping at <!-- pdf:end --> marker"
+fi
+
+# --- проверяем зависимости ---
+if ! command -v pandoc >/dev/null 2>&1; then
+  cat >&2 <<EOF
+✗ pandoc не установлен.
+
+Установка (рекомендуется):
+  brew install pandoc typst
+
+Альтернатива (LaTeX):
+  brew install pandoc
+  brew install --cask basictex
+  eval "\$(/usr/libexec/path_helper)"   # подхватить xelatex без релогина
+EOF
+  exit 1
+fi
+
+# --- выбираем движок ---
+if command -v typst >/dev/null 2>&1; then
+  ENGINE=typst
+elif command -v xelatex >/dev/null 2>&1; then
+  ENGINE=xelatex
+else
+  cat >&2 <<EOF
+✗ Нужен PDF-движок. Поставьте один из:
+  brew install typst             # рекомендуется
+  brew install --cask basictex   # LaTeX
+EOF
+  exit 1
+fi
+
+echo "→ engine: $ENGINE"
+echo "→ input:  $INPUT"
+echo "→ output: $OUTPUT"
+
+# --- собираем флаги ---
+COMMON_OPTS=(
+  --from=gfm+yaml_metadata_block+raw_attribute
+  -V papersize="$PAPER"
+  -V lang=ru
+  -V mainfont="Helvetica"
+  -V monofont="Menlo"
+  -V fontsize="$FONTSIZE"
+  -V colorlinks=true
+  -V linkcolor="0000FF"
+)
+
+if [ "$LANDSCAPE" = 1 ]; then
+  COMMON_OPTS+=(-V geometry:"margin=1.5cm,landscape")
+else
+  COMMON_OPTS+=(-V geometry:margin=2cm)
+fi
+
+[ "$WITH_TOC" = 1 ] && COMMON_OPTS+=(--toc --toc-depth=2)
+[ "$WITH_NUMBERS" = 0 ] && COMMON_OPTS+=(-V pagestyle=empty)
+
+if [ "$ENGINE" = "typst" ]; then
+  if [ "$LANDSCAPE" = 1 ]; then
+    # Two-step: pandoc → .typ → prepend landscape directive → typst compile
+    TMP="$(mktemp -t mdpdf.XXXXXX).typ"
+    PREAMBLE='#set page(flipped: true, margin: 1.5cm)
+#set text(font: ("Helvetica", "Apple Color Emoji"))
+#show table: t => block(t, breakable: true)
+#let horizontalrule = line(length: 100%, stroke: 0.5pt + luma(70%))'
+    pandoc "$INPUT" --to=typst -o "$TMP" "${COMMON_OPTS[@]}"
+    { printf '%s\n' "$PREAMBLE"; cat "$TMP"; } > "${TMP}.full"
+    typst compile "${TMP}.full" "$OUTPUT"
+    rm -f "$TMP" "${TMP}.full"
+  else
+    pandoc "$INPUT" -o "$OUTPUT" \
+      --pdf-engine=typst \
+      "${COMMON_OPTS[@]}"
+  fi
+else
+  pandoc "$INPUT" -o "$OUTPUT" \
+    --pdf-engine=xelatex \
+    -V documentclass=article \
+    -V CJKmainfont="Helvetica" \
+    "${COMMON_OPTS[@]}"
+fi
+
+echo "✓ done: $OUTPUT"
